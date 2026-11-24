@@ -1,0 +1,11 @@
+[package]
+name = "linux-tool-console"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A native Linux desktop launcher with a live output console"
+
+[dependencies]
+fltk = { version = "=1.5.23", features = ["no-pango"] }
+libc = "0.2"
+shell-words = "1.1"
