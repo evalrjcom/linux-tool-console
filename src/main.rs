@@ -1,13 +1,13 @@
 mod catalog;
+mod chooser;
 mod paint;
 mod process;
 
-use catalog::{Mode, Tool};
+use catalog::{Catalog, Mode};
 use fltk::{
     app,
     button::{Button, CheckButton},
-    dialog::{self, FileDialogType, NativeFileChooser},
-    draw,
+    dialog, draw,
     enums::{Align, Color, Event, Font, FrameType, Key},
     frame::Frame,
     input::Input,
@@ -23,11 +23,11 @@ use std::{
     path::PathBuf,
     process::{Child, Command},
     rc::Rc,
-    sync::atomic::Ordering,
 };
 
 const ROW_HEIGHT: i32 = 49;
 const OUTPUT_LIMIT: i32 = 512 * 1024;
+const OUTPUT_TRUNCATED: &str = " · earlier output omitted";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filter {
@@ -52,13 +52,14 @@ enum Action {
 }
 
 struct State {
-    tools: Vec<Tool>,
+    catalog: Catalog,
     visible: Vec<usize>,
     selected: Option<usize>,
     filter: Filter,
     scroll: i32,
     capture: Option<process::Capture>,
     elevation: Option<Child>,
+    root: bool,
 }
 
 #[derive(Clone)]
@@ -104,24 +105,31 @@ struct Ui {
     footer_note: Frame,
     buffer: TextBuffer,
     styles: TextBuffer,
+    output_truncated: bool,
+    pending_error: Option<String>,
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    if let Err(error) = process::prepare_capture() {
+        eprintln!("Could not initialize process capture: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
     let application = app::App::default().with_scheme(app::Scheme::Gtk);
     app::background(246, 244, 239);
     app::foreground(37, 41, 36);
     app::set_color(Color::Selection, 169, 64, 38);
 
     let root = unsafe { libc::geteuid() } == 0;
-    let tools = catalog::scan();
+    let catalog = Catalog::scan(root);
     let state = Rc::new(RefCell::new(State {
-        tools,
+        catalog,
         visible: Vec::new(),
         selected: None,
         filter: Filter::Featured,
         scroll: 0,
         capture: None,
         elevation: None,
+        root,
     }));
 
     let (sender, receiver) = app::channel::<Action>();
@@ -156,38 +164,47 @@ fn main() {
     ui.sync_controls(&state.borrow());
     ui.search.take_focus().ok();
 
-    let close_state = state.clone();
-    window.set_callback(move |window| {
-        // Dropping the receiver makes the worker cancel and reap its child.
-        if let Some(job) = &close_state.borrow().capture {
-            job.stop.store(true, Ordering::Relaxed);
-        }
-        window.hide();
-    });
-
-    // Wake FLTK regularly while child events and elevation status are available.
-    app::add_timeout3(0.035, |timer| app::repeat_timeout3(0.035, timer));
+    window.set_callback(|window| window.hide());
     window.show();
-    while application.wait() {
+
+    while window.shown() {
+        let polling = {
+            let state = state.borrow();
+            state.capture.is_some() || state.elevation.is_some()
+        };
+        // Keep the idle loop asleep. Timed waits are needed only while
+        // there is a capture or an authentication child to monitor.
+        if polling {
+            let _ = app::wait_for(0.035);
+        } else if !application.wait() {
+            break;
+        }
+        if !window.shown() {
+            break;
+        }
         while let Some(action) = receiver.recv() {
             if matches!(action, Action::Browse) {
-                if let Some(path) = choose_executable() {
-                    ui.browse(&mut state.borrow_mut(), path);
+                match chooser::executable() {
+                    Ok(Some(path)) => ui.browse(&mut state.borrow_mut(), path),
+                    Ok(None) => {}
+                    Err(error) => {
+                        ui.report_error(&format!("Could not open the file chooser. {error}"))
+                    }
                 }
             } else {
                 ui.act(action, &mut state.borrow_mut());
             }
         }
         ui.poll(&mut state.borrow_mut());
-    }
-    if let Some(capture) = state.borrow_mut().capture.take() {
-        capture.stop.store(true, Ordering::Relaxed);
-        while let Ok(event) = capture.events.recv() {
-            if matches!(event, process::Event::Done { .. }) {
-                break;
-            }
+        // A native dialog can re-enter FLTK callbacks. Display it only once
+        // the State borrow is released, without leaking a timer closure.
+        if let Some(error) = ui.pending_error.take() {
+            dialog::alert_default(&error);
         }
     }
+    // Dropping the capture signals its group without blocking window closure.
+    state.borrow_mut().capture.take();
+    std::process::ExitCode::SUCCESS
 }
 
 impl Ui {
@@ -370,7 +387,7 @@ impl Ui {
         });
         let footer_status = label("Ready", Font::Helvetica, 12, MUTED);
         let mut footer_note = label(
-            "Capture uses UTF-8 and closes stdin",
+            "Capture uses UTF-8 and gives stdin EOF",
             Font::Helvetica,
             12,
             MUTED,
@@ -419,6 +436,8 @@ impl Ui {
             footer_note,
             buffer,
             styles,
+            output_truncated: false,
+            pending_error: None,
         }
     }
 
@@ -509,23 +528,15 @@ impl Ui {
         let query = self.search.value().trim().to_lowercase();
         self.search.redraw();
         state.visible = state
+            .catalog
             .tools
             .iter()
             .enumerate()
             .filter_map(|(index, tool)| {
-                let visible = (state.filter == Filter::All || tool.featured || !query.is_empty())
-                    && (tool.name.to_lowercase().contains(&query)
-                        || tool.path.to_string_lossy().to_lowercase().contains(&query)
-                        || tool.path.canonicalize().is_ok_and(|path| {
-                            path.to_string_lossy().to_lowercase().contains(&query)
-                        }));
-                visible.then_some(index)
+                let included = state.filter == Filter::All || tool.featured || !query.is_empty();
+                (included && tool.matches(&query)).then_some(index)
             })
             .collect();
-        let mut paths = std::collections::HashSet::new();
-        state
-            .visible
-            .retain(|index| paths.insert(&state.tools[*index].path));
         if !state
             .selected
             .is_some_and(|index| state.visible.contains(&index))
@@ -533,7 +544,15 @@ impl Ui {
             state.selected = state.visible.first().copied();
         }
         state.scroll = 0;
-        self.update_scroll(state);
+        if let Some(row) = state
+            .visible
+            .iter()
+            .position(|&index| Some(index) == state.selected)
+        {
+            self.reveal_row(state, row);
+        } else {
+            self.update_scroll(state);
+        }
         let count = state.visible.len();
         self.count.set_label(&format!(
             "{count} {}",
@@ -564,8 +583,15 @@ impl Ui {
         }
     }
 
+    fn reveal_row(&mut self, state: &mut State, row: usize) {
+        let top = row as i32 * ROW_HEIGHT;
+        let bottom = top + ROW_HEIGHT - self.list.h().max(ROW_HEIGHT);
+        state.scroll = state.scroll.clamp(bottom.max(0), top);
+        self.update_scroll(state);
+    }
+
     fn refresh_selection(&mut self, state: &State) {
-        if let Some(tool) = state.selected.map(|index| &state.tools[index]) {
+        if let Some(tool) = state.selected.map(|index| &state.catalog.tools[index]) {
             self.name.set_label(&tool.name);
             self.kind.set_label(if tool.mode == Mode::Desktop {
                 "DESKTOP APPLICATION"
@@ -573,8 +599,8 @@ impl Ui {
                 "COMMAND LINE TOOL"
             });
             self.tool_icon.set_label(tool.icon);
-            self.path.set_label(&tool.path.to_string_lossy());
-            self.path.set_tooltip(&tool.path.to_string_lossy());
+            self.path.set_label(&tool.display_path);
+            self.path.set_tooltip(&tool.display_path);
             self.description.set_label(tool.description);
             self.args.set_value(tool.args);
             self.terminal.set_value(tool.mode == Mode::Terminal);
@@ -626,7 +652,7 @@ impl Ui {
                 self.list.redraw();
             }
             Action::Wheel(delta) => {
-                state.scroll += delta;
+                state.scroll = state.scroll.saturating_add(delta);
                 self.update_scroll(state);
                 self.list.redraw();
             }
@@ -636,17 +662,13 @@ impl Ui {
                         state.selected = Some(tool);
                         self.refresh_selection(state);
                     }
-                    let top = row as i32 * ROW_HEIGHT;
-                    state.scroll = state
-                        .scroll
-                        .clamp((top + ROW_HEIGHT - self.list.h()).max(0), top);
-                    self.update_scroll(state);
+                    self.reveal_row(state, row);
                     self.list.redraw();
                 }
             }
             Action::Browse => unreachable!("the file chooser is handled outside the state borrow"),
             Action::Run | Action::Open => {
-                let Some(tool) = state.selected.map(|index| &state.tools[index]) else {
+                let Some(tool) = state.selected.map(|index| &state.catalog.tools[index]) else {
                     return;
                 };
                 if matches!(action, Action::Run) && state.capture.is_some() {
@@ -663,9 +685,11 @@ impl Ui {
                     match process::start(&tool.path, &argv) {
                         Ok(capture) => {
                             self.clear_output();
-                            let display = std::iter::once(tool.path.to_string_lossy().into_owned())
-                                .chain(argv)
-                                .collect::<Vec<_>>();
+                            let display = std::iter::once(
+                                tool.path.to_str().unwrap_or(&tool.display_path).to_owned(),
+                            )
+                            .chain(argv)
+                            .collect::<Vec<_>>();
                             self.append(&format!("$ {}\n\n", shell_words::join(display)), 'C');
                             self.output_status("Running", false);
                             self.footer_status.set_label("Capture running");
@@ -679,7 +703,7 @@ impl Ui {
                 } else if matches!(action, Action::Open) {
                     let result = if self.terminal.value() {
                         let args = argv.into_iter().map(OsString::from).collect::<Vec<_>>();
-                        process::terminal(tool.path.as_os_str(), &args)
+                        process::terminal(tool.path.as_os_str(), &args, state.root)
                     } else {
                         let mut command = Command::new(&tool.path);
                         command.args(argv);
@@ -688,7 +712,7 @@ impl Ui {
                     match result {
                         Ok(()) => self
                             .footer_status
-                            .set_label(&format!("Opened {}", tool.name)),
+                            .set_label(&format!("Launched {}", tool.name)),
                         Err(error) => self.report_error(&format!(
                             "Could not open {}. {error}",
                             tool.path.display()
@@ -698,19 +722,23 @@ impl Ui {
             }
             Action::Stop => {
                 if let Some(capture) = &state.capture {
-                    capture.stop.store(true, Ordering::Relaxed);
-                    self.output_status("Stopping…", false);
+                    match capture.stop() {
+                        Ok(true) => self.output_status("Stopping…", false),
+                        Ok(false) => {}
+                        Err(error) => self
+                            .report_error(&format!("Could not stop the captured process. {error}")),
+                    }
                 }
             }
             Action::Root => {
-                if unsafe { libc::geteuid() } == 0 || state.elevation.is_some() {
+                if state.root || state.elevation.is_some() {
                     return;
                 }
                 match process::elevated() {
                     Ok(child) => {
-                        state.elevation = child;
+                        state.elevation = Some(child);
                         self.footer_status
-                            .set_label("Waiting for administrator authentication");
+                            .set_label("Administrator session requested");
                     }
                     Err(error) => self.report_error(&format!("Could not open as root. {error}")),
                 }
@@ -733,28 +761,23 @@ impl Ui {
             ));
             return;
         }
-        let selected = state
-            .tools
-            .iter()
-            .position(|tool| tool.path == path)
-            .unwrap_or_else(|| {
-                state.tools.push(catalog::browsed(path));
-                state.tools.len() - 1
-            });
+        let selected = state.catalog.browse(path);
         state.filter = Filter::All;
         self.search.set_value("");
         state.selected = Some(selected);
         self.refresh_catalog(state);
-        if let Some(row) = state.visible.iter().position(|&index| index == selected) {
-            state.scroll = row as i32 * ROW_HEIGHT;
-            self.update_scroll(state);
-        }
         self.refresh_selection(state);
+        self.footer_status.set_label("Executable selected");
     }
 
     fn clear_output(&mut self) {
-        self.buffer.set_text("");
         self.styles.set_text("");
+        self.buffer.set_text("");
+        self.output_truncated = false;
+        let label = self.output_state.label();
+        if let Some(status) = label.strip_suffix(OUTPUT_TRUNCATED) {
+            self.output_state.set_label(status);
+        }
         self.output.hide();
         self.empty.show();
         self.output_panel.redraw();
@@ -762,25 +785,50 @@ impl Ui {
 
     fn append(&mut self, text: &str, style: char) {
         let text = text.replace('\0', "�");
-        self.styles.append(&style.to_string().repeat(text.len()));
-        self.buffer.append(&text);
+        self.append_output(&text, &style.to_string().repeat(text.len()));
+    }
+
+    fn append_output(&mut self, text: &str, styles: &str) {
+        if text.is_empty() {
+            return;
+        }
+        debug_assert_eq!(text.len(), styles.len());
+        // Update the byte-aligned style buffer before notifying FLTK about
+        // text changes. Apply one append per batch to limit wrap calculation.
+        self.styles.append(styles);
+        self.buffer.append(text);
         if self.buffer.length() > OUTPUT_LIMIT {
             let mut cutoff = self.buffer.length() - OUTPUT_LIMIT + 4096;
             while cutoff < self.buffer.length() && self.buffer.byte_at(cutoff) & 0xc0 == 0x80 {
                 cutoff += 1;
             }
-            self.buffer.remove(0, cutoff);
             self.styles.remove(0, cutoff);
+            self.buffer.remove(0, cutoff);
+            self.mark_truncated();
         }
         self.empty.hide();
         self.output.show();
-        let end = self.buffer.length();
-        self.output.set_insert_position(end);
-        self.output.show_insert_position();
+        if !self.buffer.selected() {
+            self.output.set_insert_position(self.buffer.length());
+            self.output.show_insert_position();
+        }
+    }
+
+    fn mark_truncated(&mut self) {
+        if !self.output_truncated {
+            self.output_truncated = true;
+            let label = self.output_state.label() + OUTPUT_TRUNCATED;
+            self.output_state.set_label(&label);
+        }
     }
 
     fn output_status(&mut self, text: &str, error: bool) {
-        self.output_state.set_label(text);
+        let label = if self.output_truncated {
+            text.to_owned() + OUTPUT_TRUNCATED
+        } else {
+            text.to_owned()
+        };
+        self.output_state.set_label(&label);
         self.output_state.set_label_color(if error {
             Color::from_hex(0xff9f89)
         } else {
@@ -790,32 +838,38 @@ impl Ui {
 
     fn report_error(&mut self, text: &str) {
         self.footer_status.set_label(text);
-        let text = text.to_owned();
-        app::add_timeout3(0.0, move |_| dialog::alert_default(&text));
+        self.pending_error = Some(text.to_owned());
     }
 
     fn poll(&mut self, state: &mut State) {
         if let Some(capture) = &state.capture {
-            for _ in 0..64 {
-                match capture.events.try_recv() {
-                    Ok(process::Event::Output { text, error }) => {
-                        self.append(&text, if error { 'B' } else { 'A' })
-                    }
-                    Ok(process::Event::Done { message, success }) => {
-                        self.append(&format!("\n[{message}]\n"), if success { 'C' } else { 'B' });
-                        self.output_status(&message, !success);
-                        self.footer_status.set_label("Capture finished");
-                        state.capture = None;
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.output_status("Capture ended unexpectedly", true);
-                        self.footer_status.set_label("Capture ended unexpectedly");
-                        state.capture = None;
-                        break;
-                    }
-                }
+            let batch = capture.take_output();
+            let mut text = String::new();
+            let mut styles = String::new();
+            if batch.omitted > 0 {
+                let notice = format!(
+                    "[Omitted {} bytes of earlier capture output]\n",
+                    batch.omitted
+                );
+                styles.push_str(&"C".repeat(notice.len()));
+                text.push_str(&notice);
+                self.mark_truncated();
+            }
+            for output in batch.output {
+                let chunk = output.text.replace('\0', "�");
+                let style = if output.error { "B" } else { "A" };
+                styles.push_str(&style.repeat(chunk.len()));
+                text.push_str(&chunk);
+            }
+            self.append_output(&text, &styles);
+            if let Some(done) = batch.done {
+                self.append(
+                    &format!("\n[{}]\n", done.message),
+                    if done.success { 'C' } else { 'B' },
+                );
+                self.output_status(&done.message, !done.success);
+                self.footer_status.set_label("Capture finished");
+                state.capture = None;
             }
             self.sync_controls(state);
         }
@@ -825,32 +879,22 @@ impl Ui {
                 state.elevation = None;
                 self.sync_controls(state);
                 match result {
-                    Ok(Some(status)) if status.success() => {
-                        self.footer_status.set_label("Privileged window closed")
-                    }
+                    Ok(Some(status)) if status.success() => self
+                        .footer_status
+                        .set_label("Administrator session finished"),
                     Ok(Some(status)) if status.code() == Some(126) => {
                         self.footer_status.set_label("Authentication canceled")
                     }
-                    _ => match process::elevated_with_sudo() {
-                        Ok(()) => self
-                            .footer_status
-                            .set_label("Waiting for administrator authentication in a terminal"),
-                        Err(error) => self
-                            .report_error(&format!("Could not open a privileged window. {error}")),
-                    },
+                    Ok(Some(status)) => self
+                        .report_error(&format!("The administrator session ended with {status}.")),
+                    Err(error) => self.report_error(&format!(
+                        "Could not monitor the administrator session. {error}"
+                    )),
+                    Ok(None) => {}
                 }
             }
         }
     }
-}
-
-fn choose_executable() -> Option<PathBuf> {
-    let mut chooser = NativeFileChooser::new(FileDialogType::BrowseFile);
-    chooser.set_title("Select an executable");
-    chooser.set_directory(&"/usr/bin").ok();
-    chooser.show();
-    let path = chooser.filename();
-    (!path.as_os_str().is_empty()).then_some(path)
 }
 
 fn bind<W: WidgetExt>(widget: &mut W, sender: app::Sender<Action>, action: Action) {
@@ -902,7 +946,7 @@ fn catalog_list(state: Rc<RefCell<State>>, sender: app::Sender<Action>) -> Frame
             .skip(start)
             .take((h / ROW_HEIGHT + 2) as usize)
         {
-            let tool = &state.tools[index];
+            let tool = &state.catalog.tools[index];
             let y = y + row as i32 * ROW_HEIGHT - state.scroll;
             let selected = state.selected == Some(index);
             if selected {
@@ -949,7 +993,7 @@ fn catalog_list(state: Rc<RefCell<State>>, sender: app::Sender<Action>) -> Frame
             draw::set_font(Font::Courier, 11);
             draw::set_draw_color(MUTED);
             draw::draw_text2(
-                &tool.path.to_string_lossy(),
+                &tool.display_path,
                 x + 51,
                 y + 25,
                 w - 58,
@@ -967,11 +1011,10 @@ fn catalog_list(state: Rc<RefCell<State>>, sender: app::Sender<Action>) -> Frame
             true
         }
         Event::MouseWheel => {
-            let delta = match app::event_dy() {
-                app::MouseWheel::Up => -ROW_HEIGHT,
-                app::MouseWheel::Down => ROW_HEIGHT,
-                _ => return false,
-            };
+            let delta = app::event_dy_value().saturating_mul(ROW_HEIGHT);
+            if delta == 0 {
+                return false;
+            }
             sender.send(Action::Wheel(delta));
             true
         }

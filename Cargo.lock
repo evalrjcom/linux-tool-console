@@ -89,6 +89,7 @@ name = "linux-tool-console"
 version = "0.1.0"
 dependencies = [
  "fltk",
+ "fltk-sys",
  "libc",
  "shell-words",
 ]
